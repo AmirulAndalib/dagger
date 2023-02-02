@@ -1533,7 +1533,7 @@
     "@docsearch/css" "3.1.1"
     algoliasearch "^4.0.0"
 
-"@docusaurus/core@2.3.0", "@docusaurus/core@^2.0.0-beta.5", "@docusaurus/core@^2.2.0":
+"@docusaurus/core@2.3.0", "@docusaurus/core@^2.0.0-beta.5", "@docusaurus/core@^2.3.0":
   version "2.3.0"
   resolved "https://registry.yarnpkg.com/@docusaurus/core/-/core-2.3.0.tgz#19f1b6261453a848c50213bbc22f7d06ab9046ac"
   integrity sha512-2AU5HfKyExO+/mi41SBnx5uY0aGZFXr3D93wntBY4lN1gsDKUpi7EE4lPBAXm9CoH4Pw6N24yDHy9CPR3sh/uA==
