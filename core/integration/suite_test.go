@@ -2,34 +2,87 @@ package core
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/md5"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
-	"dagger.io/dagger"
-	"github.com/dagger/dagger/core"
-	"github.com/dagger/dagger/internal/testutil"
 	"github.com/moby/buildkit/identity"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+
+	"dagger.io/dagger"
+	"dagger.io/dagger/telemetry"
+	"github.com/dagger/dagger/core"
+	"github.com/dagger/dagger/internal/testutil"
+	"github.com/dagger/dagger/testctx"
 )
 
-func connect(t *testing.T) (*dagger.Client, context.Context) {
-	ctx := context.Background()
-	client, err := dagger.Connect(ctx, dagger.WithLogOutput(os.Stderr))
-	require.NoError(t, err)
-	return client, ctx
+var testCtx = context.Background()
+
+func TestMain(m *testing.M) {
+	// Preserve original SSH_AUTH_SOCK value and
+	// Ensure SSH_AUTH_SOCK does not pollute tests state
+	origAuthSock := os.Getenv("SSH_AUTH_SOCK")
+	os.Unsetenv("SSH_AUTH_SOCK")
+
+	testCtx = telemetry.InitEmbedded(testCtx, nil)
+	res := m.Run()
+	telemetry.Close()
+
+	if origAuthSock != "" {
+		os.Setenv("SSH_AUTH_SOCK", origAuthSock)
+	}
+	os.Exit(res)
 }
 
-func newCache(t *testing.T) core.CacheID {
+const InstrumentationLibrary = "dagger.io/integration"
+
+func Tracer() trace.Tracer {
+	return otel.Tracer(InstrumentationLibrary)
+}
+
+func Logger() log.Logger {
+	return telemetry.Logger(testCtx, InstrumentationLibrary)
+}
+
+func Middleware() []testctx.Middleware {
+	return []testctx.Middleware{
+		testctx.WithParallel,
+		testctx.WithOTelLogging(Logger()),
+		testctx.WithOTelTracing(Tracer()),
+	}
+}
+
+func connect(ctx context.Context, t *testctx.T, opts ...dagger.ClientOpt) *dagger.Client {
+	opts = append([]dagger.ClientOpt{
+		dagger.WithLogOutput(testutil.NewTWriter(t.T)),
+	}, opts...)
+	client, err := dagger.Connect(ctx, opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { client.Close() })
+	return client
+}
+
+func newCache(t *testctx.T) core.CacheVolumeID {
 	var res struct {
 		CacheVolume struct {
-			ID core.CacheID
+			ID core.CacheVolumeID
 		}
 	}
 
-	err := testutil.Query(`
+	err := testutil.Query(t, `
 		query CreateCache($key: String!) {
 			cacheVolume(key: $key) {
 				id
@@ -43,7 +96,7 @@ func newCache(t *testing.T) core.CacheID {
 	return res.CacheVolume.ID
 }
 
-func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
+func newDirWithFile(t *testctx.T, path, contents string) core.DirectoryID {
 	dirRes := struct {
 		Directory struct {
 			WithNewFile struct {
@@ -52,7 +105,7 @@ func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
 		}
 	}{}
 
-	err := testutil.Query(
+	err := testutil.Query(t,
 		`query Test($path: String!, $contents: String!) {
 			directory {
 				withNewFile(path: $path, contents: $contents) {
@@ -68,42 +121,7 @@ func newDirWithFile(t *testing.T, path, contents string) core.DirectoryID {
 	return dirRes.Directory.WithNewFile.ID
 }
 
-func newSecret(t *testing.T, content string) core.SecretID {
-	var secretRes struct {
-		Directory struct {
-			WithNewFile struct {
-				File struct {
-					Secret struct {
-						ID core.SecretID
-					}
-				}
-			}
-		}
-	}
-
-	err := testutil.Query(
-		`query Test($content: String!) {
-			directory {
-				withNewFile(path: "some-file", contents: $content) {
-					file(path: "some-file") {
-						secret {
-							id
-						}
-					}
-				}
-			}
-		}`, &secretRes, &testutil.QueryOptions{Variables: map[string]any{
-			"content": content,
-		}})
-	require.NoError(t, err)
-
-	secretID := secretRes.Directory.WithNewFile.File.Secret.ID
-	require.NotEmpty(t, secretID)
-
-	return secretID
-}
-
-func newFile(t *testing.T, path, contents string) core.FileID {
+func newFile(t *testctx.T, path, contents string) core.FileID {
 	var secretRes struct {
 		Directory struct {
 			WithNewFile struct {
@@ -114,7 +132,7 @@ func newFile(t *testing.T, path, contents string) core.FileID {
 		}
 	}
 
-	err := testutil.Query(
+	err := testutil.Query(t,
 		`query Test($path: String!, $contents: String!) {
 			directory {
 				withNewFile(path: $path, contents: $contents) {
@@ -135,63 +153,17 @@ func newFile(t *testing.T, path, contents string) core.FileID {
 	return fileID
 }
 
-func startRegistry(ctx context.Context, c *dagger.Client, t *testing.T) {
-	t.Helper()
+const (
+	registryHost        = "registry:5000"
+	privateRegistryHost = "privateregistry:5000"
+)
 
-	// include a random ID so it runs every time (hack until we have no-cache or equivalent support)
-	randomID := identity.NewID()
-	go func() {
-		_, err := c.Container().
-			From("registry:2").
-			WithEnvVariable("RANDOM", randomID).
-			WithExec([]string{}).
-			ExitCode(ctx)
-		if err != nil {
-			t.Logf("error running registry: %v", err)
-		}
-	}()
-
-	_, err := c.Container().
-		From("alpine:3.16.2").
-		WithEnvVariable("RANDOM", randomID).
-		WithExec([]string{"sh", "-c", "for i in $(seq 1 60); do nc -zv 127.0.0.1 5000 && exit 0; sleep 1; done; exit 1"}).
-		ExitCode(ctx)
-	require.NoError(t, err)
+func registryRef(name string) string {
+	return fmt.Sprintf("%s/%s:%s", registryHost, name, identity.NewID())
 }
 
-func startPrivateRegistry(ctx context.Context, c *dagger.Client, t *testing.T) {
-	t.Helper()
-
-	// Include a random ID so it runs every time (hack until we have no-cache or equivalent support)
-	randomID := identity.NewID()
-	go func() {
-		_, err := c.Container().
-			From("registry:2").
-			WithMountedDirectory("/auth", c.
-				Directory().
-				// Plaintext = john:xFlejaPdjrt25Dvr
-				WithNewFile("htpasswd", "john:$2y$05$/iP8ud0Fs8o3NLlElyfVVOp6LesJl3oRLYoc3neArZKWX10OhynSC"),
-			).
-			WithEnvVariable("REGISTRY_HTTP_ADDR", "127.0.0.1:5010").
-			WithEnvVariable("REGISTRY_AUTH", "htpasswd").
-			WithEnvVariable("REGISTRY_AUTH_HTPASSWD_REALM", "Registry Realm").
-			WithEnvVariable("REGISTRY_AUTH_HTPASSWD_PATH", "/auth/htpasswd").
-			WithEnvVariable("RANDOM", randomID).
-			WithExec([]string{}).
-			ExitCode(ctx)
-
-		if err != nil {
-			t.Logf("error running registry: %v", err)
-		}
-	}()
-
-	// Wait for registry to be ready
-	_, err := c.Container().
-		From("alpine:3.16.2").
-		WithEnvVariable("RANDOM", randomID).
-		WithExec([]string{"sh", "-c", "for i in $(seq 1 60); do nc -zv 127.0.0.1 5010 && exit 0; sleep 1; done; exit 1"}).
-		ExitCode(ctx)
-	require.NoError(t, err)
+func privateRegistryRef(name string) string {
+	return fmt.Sprintf("%s/%s:%s", privateRegistryHost, name, identity.NewID())
 }
 
 func ls(dir string) ([]string, error) {
@@ -207,7 +179,7 @@ func ls(dir string) ([]string, error) {
 	return names, nil
 }
 
-func tarEntries(t *testing.T, path string) []string {
+func tarEntries(t testing.TB, path string) []string {
 	f, err := os.Open(path)
 	require.NoError(t, err)
 
@@ -226,4 +198,185 @@ func tarEntries(t *testing.T, path string) []string {
 	}
 
 	return entries
+}
+
+func readTarFile(t testing.TB, pathToTar, pathInTar string) []byte {
+	f, err := os.Open(pathToTar)
+	require.NoError(t, err)
+
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			require.NoError(t, err)
+		}
+
+		if hdr.Name == pathInTar {
+			b, err := io.ReadAll(tr)
+			require.NoError(t, err)
+			return b
+		}
+	}
+
+	return nil
+}
+
+func computeMD5FromReader(reader io.Reader) string {
+	h := md5.New()
+	io.Copy(h, reader)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func daggerCliPath(t testing.TB) string {
+	t.Helper()
+	cliPath := os.Getenv("_EXPERIMENTAL_DAGGER_CLI_BIN")
+	if cliPath == "" {
+		var err error
+		cliPath, err = exec.LookPath("dagger")
+		require.NoError(t, err)
+	}
+	if cliPath == "" {
+		t.Log("missing _EXPERIMENTAL_DAGGER_CLI_BIN")
+		t.FailNow()
+	}
+	return cliPath
+}
+
+func daggerLinuxCliPath(t testing.TB) string {
+	if runtime.GOOS == "linux" {
+		return daggerCliPath(t)
+	}
+	cliPath := os.Getenv("_TEST_DAGGER_CLI_LINUX_BIN")
+	if cliPath == "" {
+		t.Log("missing _TEST_DAGGER_CLI_LINUX_BIN")
+		t.FailNow()
+	}
+	return cliPath
+}
+
+func daggerCliFile(t testing.TB, c *dagger.Client) *dagger.File {
+	// This loads the dagger-cli binary from the host into the container, that
+	// was set up by the test caller. This is used to communicate with the dev
+	// engine.
+	t.Helper()
+	return c.Host().File(daggerLinuxCliPath(t))
+}
+
+func daggerCliBase(t testing.TB, c *dagger.Client) *dagger.Container {
+	t.Helper()
+	return c.Container().From(golangImage).
+		WithMountedFile(testCLIBinPath, daggerCliFile(t, c)).
+		WithWorkdir("/work")
+}
+
+const testCLIBinPath = "/bin/dagger"
+
+func goCache(c *dagger.Client) dagger.WithContainerFunc {
+	return func(ctr *dagger.Container) *dagger.Container {
+		return ctr.
+			WithMountedCache("/go/pkg/mod", c.CacheVolume("go-mod")).
+			WithEnvVariable("GOMODCACHE", "/go/pkg/mod").
+			WithMountedCache("/go/build-cache", c.CacheVolume("go-build")).
+			WithEnvVariable("GOCACHE", "/go/build-cache")
+	}
+}
+
+type safeBuffer struct {
+	bu bytes.Buffer
+	mu sync.Mutex
+}
+
+func (s *safeBuffer) Write(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bu.String()
+}
+
+func limitTicker(interval time.Duration, limit int) <-chan time.Time {
+	ch := make(chan time.Time, limit)
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		defer close(ch)
+		for i := 0; i < limit; i++ {
+			ch <- <-ticker.C
+		}
+	}()
+	return ch
+}
+
+// ensure the cache mount doesn't get pruned in the middle of the test by having a container
+// run throughout with the cache mounted
+func preventCacheMountPrune(ctx context.Context, t *testctx.T, c *dagger.Client, cache *dagger.CacheVolume, opts ...dagger.ContainerWithMountedCacheOpts) func() error {
+	t.Helper()
+	ctx, cancel := context.WithCancelCause(ctx)
+	cancelErr := errors.New("test done")
+	t.Cleanup(func() {
+		cancel(cancelErr)
+	})
+	defer cancel(cancelErr)
+	var eg errgroup.Group
+	eg.Go(func() error {
+		_, err := c.Container().
+			From(alpineImage).
+			WithMountedCache("/cache", cache, opts...).
+			WithExec([]string{"sh", "-c", "sleep 9999"}).
+			Sync(ctx)
+		if errors.Is(err, cancelErr) {
+			return nil
+		}
+		return err
+	})
+
+	return func() error {
+		cancel(cancelErr)
+		return eg.Wait()
+	}
+}
+
+// requireErrOut is the same as require.ErrorContains, except it also looks in
+// the Stdout/Stderr of a *dagger.ExecErr, since that's something we do a lot
+// in tests.
+//
+// TODO: A better alternative might be to record the log output and assert
+// against what the user sees there, but that's a bigger lift.
+func requireErrOut(t *testctx.T, err error, out string) {
+	var execErr *dagger.ExecError
+	if errors.As(err, &execErr) {
+		require.Contains(
+			t,
+			fmt.Sprintf("%s\nStdout: %s\nStderr: %s", err, execErr.Stdout, execErr.Stderr),
+			out,
+		)
+		return
+	}
+	require.ErrorContains(t, err, out)
+}
+
+// requireErrRegexp is the same as require.Regexp against err.Error(), except
+// it also looks in the Stdout/Stderr of a *dagger.ExecErr, since that's
+// something we do a lot in tests.
+//
+// TODO: A better alternative might be to record the log output and assert
+// against what the user sees there, but that's a bigger lift.
+func requireErrRegexp(t *testctx.T, err error, re string) {
+	var execErr *dagger.ExecError
+	if errors.As(err, &execErr) {
+		require.Regexp(
+			t,
+			re,
+			fmt.Sprintf("%s\nStdout: %s\nStderr: %s", err, execErr.Stdout, execErr.Stderr),
+		)
+		return
+	}
+	require.Regexp(t, re, err.Error())
 }
